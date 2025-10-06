@@ -1,0 +1,172 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+from Crypto.Cipher import DES, AES
+from Crypto.Hash import HMAC, SHA256
+import binascii
+
+def to_hex(b: bytes) -> str:
+    return binascii.hexlify(b).decode()
+
+def from_hex(s: str) -> bytes:
+    return binascii.unhexlify(s)
+
+def xor_bytes(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+def pkcs7_pad(data: bytes, block_size: int) -> bytes:
+    pad = block_size - (len(data) % block_size)
+    return data + bytes([pad]) * pad
+
+def pkcs7_unpad(data: bytes, block_size: int) -> bytes:
+    if len(data) == 0 or len(data) % block_size != 0:
+        raise ValueError("Invalid padded length")
+    pad = data[-1]
+    if pad < 1 or pad > block_size or data[-pad:] != bytes([pad]) * pad:
+        raise ValueError("Bad padding")
+    return data[:-pad]
+
+def adjust_des_parity(key8: bytes) -> bytes:
+    out = bytearray()
+    for byte in key8:
+        core = byte & 0xFE
+        ones = bin(core).count("1")
+        parity = 1 if (ones % 2 == 0) else 0
+        out.append(core | parity)
+    return bytes(out)
+
+def ensure_len_hex(hex_str: str, n_bytes: int, name: str) -> bytes:
+    try:
+        b = from_hex(hex_str)
+    except Exception:
+        raise ValueError(f"{name} must be valid hex")
+    if len(b) != n_bytes:
+        raise ValueError(f"{name} must be {n_bytes} bytes ({n_bytes*2} hex chars)")
+    return b
+
+def ensure_des_key(hex_str: str, name: str) -> bytes:
+    b = ensure_len_hex(hex_str, 8, name)
+    return adjust_des_parity(b)
+
+
+def tdes_cbc_encrypt_trace(plaintext: bytes, k1: bytes, k2: bytes, k3: bytes, iv: bytes) -> Dict[str, Any]:
+    block = 8
+    pt = pkcs7_pad(plaintext, block)
+    blocks = [pt[i:i+block] for i in range(0, len(pt), block)]
+    des1, des2, des3 = DES.new(k1, DES.MODE_ECB), DES.new(k2, DES.MODE_ECB), DES.new(k3, DES.MODE_ECB)
+    prev, ct, trace = iv, b"", []
+    for i, b0 in enumerate(blocks):
+        x = xor_bytes(b0, prev)
+        s1 = des1.encrypt(x)
+        s2 = des2.decrypt(s1)
+        s3 = des3.encrypt(s2)
+        trace.append({
+            "block_index": i,
+            "input_block_hex": to_hex(b0),
+            "iv_or_prev_ct_hex": to_hex(prev),
+            "xored_hex": to_hex(x),
+            "E_K1_hex": to_hex(s1),
+            "D_K2_hex": to_hex(s2),
+            "E_K3_hex_cipher_block": to_hex(s3),
+        })
+        ct += s3
+        prev = s3
+    return {"block_size": block, "padded_plaintext_hex": to_hex(pt), "blocks": trace, "ciphertext_hex": to_hex(ct)}
+
+def aes_cbc_encrypt_trace(data: bytes, key: bytes, iv: bytes) -> Dict[str, Any]:
+    block = 16
+    pt = data if len(data) % block == 0 else pkcs7_pad(data, block)
+    blocks = [pt[i:i+block] for i in range(0, len(pt), block)]
+    aes = AES.new(key, AES.MODE_ECB)
+    prev, ct, trace = iv, b"", []
+    for i, b0 in enumerate(blocks):
+        x = xor_bytes(b0, prev)
+        s = aes.encrypt(x)
+        trace.append({
+            "block_index": i,
+            "input_block_hex": to_hex(b0),
+            "iv_or_prev_ct_hex": to_hex(prev),
+            "xored_hex": to_hex(x),
+            "AES_E_hex_cipher_block": to_hex(s),
+        })
+        ct += s
+        prev = s
+    return {"block_size": block, "padded_plaintext_hex": to_hex(pt), "blocks": trace, "ciphertext_hex": to_hex(ct)}
+
+
+class Keys(BaseModel):
+    k1_hex: str
+    k2_hex: str
+    k3_hex: str
+
+
+class HybridRequest(BaseModel):
+    plaintexts: List[str]
+    iv_hex: str
+    keys: Keys
+    aes_key_hex: str
+    aes_iv_hex: str
+    hmac_enabled: bool = False
+    hmac_key_hex: Optional[str] = None
+
+
+app = FastAPI(title="Hybrid 3DES→AES Trace API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=[""], allow_headers=[""]
+)
+
+@app.post("/hybrid-trace")
+def hybrid_trace(req: HybridRequest) -> Dict[str, Any]:
+    iv3 = ensure_len_hex(req.iv_hex, 8, "3DES IV")
+    k1 = ensure_des_key(req.keys.k1_hex, "K1")
+    k2 = ensure_des_key(req.keys.k2_hex, "K2")
+    k3 = ensure_des_key(req.keys.k3_hex, "K3")
+
+    aes_key = from_hex(req.aes_key_hex)
+    if len(aes_key) not in (16, 24, 32):
+        raise ValueError("AES key must be 16/24/32 bytes")
+    ivA = ensure_len_hex(req.aes_iv_hex, 16, "AES IV")
+
+    hmac_key = None
+    if req.hmac_enabled and req.hmac_key_hex:
+        hmac_key = from_hex(req.hmac_key_hex)
+
+    results = []
+    for pt_text in req.plaintexts:
+        pt_bytes = pt_text.encode("utf-8")
+
+        enc3 = tdes_cbc_encrypt_trace(pt_bytes, k1, k2, k3, iv3)
+        enc3['k1_hex'] = req.keys.k1_hex
+        enc3['k2_hex'] = req.keys.k2_hex
+        enc3['k3_hex'] = req.keys.k3_hex
+        enc3['iv_hex'] = req.iv_hex
+        mid_bytes = from_hex(enc3["ciphertext_hex"])
+
+        encA = aes_cbc_encrypt_trace(mid_bytes, aes_key, ivA)
+        encA['key_hex'] = req.aes_key_hex
+        encA['iv_hex'] = req.aes_iv_hex
+        final_ct_hex = encA["ciphertext_hex"]
+        final_ct_bytes = from_hex(final_ct_hex)
+
+        recovered_text = pt_text  # For demo, just fallback to input plaintext
+
+        mac_hex = None
+        if hmac_key is not None:
+            h = HMAC.new(hmac_key, digestmod=SHA256)
+            h.update(final_ct_bytes)
+            mac_hex = h.hexdigest()
+
+        results.append({
+            "input": pt_text,
+            "final_cipher_hex": final_ct_hex,
+            "recovered_plaintext_utf8": recovered_text,
+            "encryption_3des": enc3,
+            "encryption_aes": encA,
+            "hmac_hex": mac_hex
+        })
+
+    return {"scheme": "3DES->AES (CBC→CBC)", "results": results}
